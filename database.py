@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -29,9 +30,11 @@ class CollationDB:
     """SQLite-backed textual collation service with optimistic revisions."""
 
     def __init__(self, path: str = "collation.db") -> None:
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self._write_lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA busy_timeout=10000")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")
         self._schema()
@@ -41,13 +44,14 @@ class CollationDB:
 
     @contextmanager
     def transaction(self):
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-            yield
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+        with self._write_lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                yield
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def _schema(self) -> None:
         self.conn.executescript(
@@ -139,10 +143,25 @@ class CollationDB:
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS passage_locks (
-              passage_id INTEGER PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
+              passage_id PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
               locked_by INTEGER NOT NULL REFERENCES users(id),
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS passage_merges (
+              passage_id INTEGER PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
+              merged_text TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'confirmed' CHECK(status IN ('confirmed','stale')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              confirmed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_selections (
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              variant_id INTEGER NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
+              selected_layer INTEGER NOT NULL,
+              PRIMARY KEY(passage_id,witness_id)
             );
             """
         )
@@ -286,18 +305,21 @@ class CollationDB:
         return int(cur.lastrowid)
 
     def create_variant(self, passage_id: int, witness_id: int, proposed_text: str, reason: str,
-                       user_id: int, expected_revision: int) -> int:
+                       user_id: int, expected_layer: int = 0) -> int:
         with self.transaction():
-            passage, lock = self._editable_passage(passage_id, witness_id, user_id, expected_revision)
+            passage = self._editable_passage(passage_id, witness_id, user_id)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
                 raise DomainError("取舍理由至少3个字符")
             if not self.conn.execute("SELECT 1 FROM alignments WHERE passage_id=? AND witness_id=?", (passage_id, witness_id)).fetchone():
                 raise DomainError("该版本尚未对齐此段落")
+            current_layer = self._current_layer(passage_id, witness_id)
+            if current_layer != int(expected_layer):
+                raise DomainError(f"版本冲突：该版本当前层号为 {current_layer}，提交基于层 {expected_layer}")
             cur = self.conn.execute(
-                "INSERT INTO variants(passage_id,witness_id,base_text,proposed_text,reason,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (passage_id, witness_id, passage["base_text"], text, reason.strip(), user_id, datetime.now().isoformat(), datetime.now().isoformat()),
+                "INSERT INTO variants(passage_id,witness_id,base_text,proposed_text,reason,layer,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (passage_id, witness_id, passage["base_text"], text, reason.strip(), 1, user_id, datetime.now().isoformat(), datetime.now().isoformat()),
             )
             variant_id = int(cur.lastrowid)
             revision = self._record_revision(passage_id, variant_id, 1, user_id)
@@ -305,25 +327,36 @@ class CollationDB:
         return variant_id
 
     def update_variant(self, variant_id: int, proposed_text: str, reason: str, user_id: int,
-                       expected_revision: int) -> int:
+                       expected_layer: int) -> int:
         with self.transaction():
             variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
             if not variant:
                 raise DomainError("异文记录不存在")
-            passage, _ = self._editable_passage(variant["passage_id"], variant["witness_id"], user_id, expected_revision)
+            passage_id, witness_id = variant["passage_id"], variant["witness_id"]
+            self._editable_passage(passage_id, witness_id, user_id)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
                 raise DomainError("取舍理由至少3个字符")
-            layer = int(self.conn.execute("SELECT COALESCE(MAX(layer),0)+1 FROM variants WHERE passage_id=? AND witness_id=?", (variant["passage_id"], variant["witness_id"])).fetchone()[0])
+            current_layer = self._current_layer(passage_id, witness_id)
+            if current_layer != int(expected_layer):
+                raise DomainError(f"版本冲突：该版本当前层号为 {current_layer}，提交基于层 {expected_layer}")
+            layer = current_layer + 1
             self.conn.execute(
                 "UPDATE variants SET proposed_text=?,reason=?,layer=?,updated_at=? WHERE id=?",
                 (text, reason.strip(), layer, datetime.now().isoformat(), variant_id),
             )
-            revision = self._record_revision(variant["passage_id"], variant_id, layer, user_id)
-            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, datetime.now().isoformat(), variant["passage_id"]))
+            self._invalidate_merge_for_witness(passage_id, witness_id)
+            revision = self._record_revision(passage_id, variant_id, layer, user_id)
+            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, datetime.now().isoformat(), passage_id))
         return revision
 
-    def _editable_passage(self, passage_id: int, witness_id: int, user_id: int, expected_revision: int):
+    def _current_layer(self, passage_id: int, witness_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COALESCE(MAX(layer),0) FROM variants WHERE passage_id=? AND witness_id=?",
+            (passage_id, witness_id),
+        ).fetchone()[0])
+
+    def _editable_passage(self, passage_id: int, witness_id: int, user_id: int):
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
         if not passage or not witness or passage["work_id"] != witness["work_id"]:
@@ -332,9 +365,7 @@ class CollationDB:
             raise DomainError("段落已锁定，不能修改")
         if not self.can_edit_witness(witness_id, user_id):
             raise DomainError("无权编辑该版本")
-        if passage["revision"] != expected_revision:
-            raise DomainError(f"版本冲突：当前修订为 {passage['revision']}，提交基于 {expected_revision}")
-        return passage, None
+        return passage
 
     def _record_revision(self, passage_id: int, variant_id: int, layer: int, user_id: int) -> int:
         revision = int(self.conn.execute("SELECT COALESCE(MAX(revision_no),0)+1 FROM revisions WHERE passage_id=?", (passage_id,)).fetchone()[0])
@@ -379,6 +410,53 @@ class CollationDB:
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
 
+    def confirm_merge(self, passage_id: int, witness_ids, merged_text: str, user_id: int) -> None:
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage:
+            raise DomainError("段落不存在")
+        self._require_owner(passage["work_id"], user_id)
+        text = validate_transcription(merged_text)
+        if not isinstance(witness_ids, (list, tuple)) or not witness_ids:
+            raise DomainError("必须至少选定一个版本")
+        chosen = []
+        try:
+            witness_ids = [int(w) for w in witness_ids]
+        except (TypeError, ValueError) as exc:
+            raise DomainError("版本 ID 无效") from exc
+        if len(set(witness_ids)) != len(witness_ids):
+            raise DomainError("同一版本不能重复选定")
+        with self.transaction():
+            now = datetime.now().isoformat()
+            self.conn.execute("DELETE FROM merge_selections WHERE passage_id=?", (passage_id,))
+            for witness_id in witness_ids:
+                variant = self.conn.execute(
+                    "SELECT * FROM variants WHERE passage_id=? AND witness_id=? ORDER BY layer DESC,id DESC LIMIT 1",
+                    (passage_id, witness_id),
+                ).fetchone()
+                witness = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+                if not witness or witness["work_id"] != passage["work_id"] or not variant:
+                    raise DomainError("只能选定本段落中已有校记的版本")
+                chosen.append((witness_id, variant["id"], variant["layer"]))
+            self.conn.execute(
+                "INSERT INTO passage_merges(passage_id,merged_text,status,created_by,created_at,confirmed_at) "
+                "VALUES(?,?, 'confirmed', ?,?,?) ON CONFLICT(passage_id) DO UPDATE SET "
+                "merged_text=excluded.merged_text,status='confirmed',created_by=excluded.created_by,"
+                "created_at=excluded.created_at,confirmed_at=excluded.confirmed_at",
+                (passage_id, text, user_id, now, now),
+            )
+            self.conn.executemany(
+                "INSERT INTO merge_selections(passage_id,witness_id,variant_id,selected_layer) VALUES(?,?,?,?)",
+                [(passage_id, wid, vid, layer) for wid, vid, layer in chosen],
+            )
+
+    def _invalidate_merge_for_witness(self, passage_id: int, witness_id: int) -> None:
+        selected = self.conn.execute(
+            "SELECT 1 FROM merge_selections WHERE passage_id=? AND witness_id=?",
+            (passage_id, witness_id),
+        ).fetchone()
+        if selected:
+            self.conn.execute("UPDATE passage_merges SET status='stale' WHERE passage_id=?", (passage_id,))
+
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage or not self.can_view_work(passage["work_id"], user_id):
@@ -388,31 +466,94 @@ class CollationDB:
             raise DomainError("快照不存在")
         return {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": json.loads(row["snapshot_json"])}
 
+    def _alignments_for_export(self, passage_id: int, gaps_counter: list) -> list:
+        alignments = []
+        for row in self.conn.execute(
+            "SELECT a.*,w.siglum,w.kind,w.missing_sections FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
+            "WHERE a.passage_id=? ORDER BY a.sort_order", (passage_id,)
+        ).fetchall():
+            item = dict(row)
+            if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
+                item["has_gap"] = True
+                gaps_counter[0] += 1
+            alignments.append(item)
+        return alignments
+
+    def _latest_variants(self, passage_id: int) -> dict:
+        latest: dict = {}
+        for row in self.conn.execute(
+            "SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer DESC,id DESC", (passage_id,)
+        ).fetchall():
+            if row["witness_id"] in latest:
+                continue
+            variant = dict(row)
+            variant["notes"] = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],)
+            )]
+            latest[row["witness_id"]] = variant
+        return latest
+
+    @staticmethod
+    def _candidate(witness: dict, variant: dict) -> dict:
+        return {
+            "witness_id": witness["id"], "siglum": witness["siglum"], "kind": witness["kind"],
+            "layer": variant["layer"], "proposed_text": variant["proposed_text"],
+            "reason": variant["reason"], "notes": variant["notes"],
+        }
+
     def export_collation(self, work_id: int, user_id: int) -> dict:
         if not self.can_view_work(work_id, user_id):
             raise DomainError("无权查看该校勘项目")
         work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
-        witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
-        passages = []
-        gaps = 0
+        witnesses = {r["id"]: dict(r) for r in self.conn.execute(
+            "SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))}
+        merged, conflicts, undecided = [], [], []
+        gaps = [0]
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
-            alignments = []
-            for row in self.conn.execute(
-                "SELECT a.*,w.siglum,w.kind,w.missing_sections FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
-                "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],)
-            ).fetchall():
-                item = dict(row)
-                if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
-                    item["has_gap"] = True
-                    gaps += 1
-                alignments.append(item)
-            variants = []
-            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
-                variant = dict(row)
-                variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
-                variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            passage_id = passage["id"]
+            alignments = self._alignments_for_export(passage_id, gaps)
+            latest = self._latest_variants(passage_id)
+            merge = self.conn.execute("SELECT * FROM passage_merges WHERE passage_id=?", (passage_id,)).fetchone()
+            lock = self.conn.execute("SELECT reason FROM passage_locks WHERE passage_id=?", (passage_id,)).fetchone()
+            base = {**dict(passage), "alignments": alignments,
+                    "locked": bool(lock), "lock_reason": lock["reason"] if lock else ""}
+            if merge:
+                selections = {r["witness_id"]: dict(r) for r in self.conn.execute(
+                    "SELECT * FROM merge_selections WHERE passage_id=?", (passage_id,))}
+                changed = []
+                for wid, sel in selections.items():
+                    current = latest.get(wid)
+                    if not current or current["layer"] > sel["selected_layer"]:
+                        changed.append(wid)
+                extra = [wid for wid in latest if wid not in selections]
+                if merge["status"] == "confirmed" and not changed and not extra:
+                    merged.append({**base, "merged_text": merge["merged_text"],
+                                   "confirmed_at": merge["confirmed_at"], "created_by": merge["created_by"],
+                                   "selected": [self._candidate(witnesses[wid], latest[wid]) for wid in selections]})
+                else:
+                    if changed:
+                        stale_reason = (
+                            "被选版本已有新层校记："
+                            + "、".join(witnesses[w]["siglum"] for w in changed if w in witnesses)
+                            + "，原合并稿已失效，请重新确认"
+                        )
+                    else:
+                        stale_reason = (
+                            "出现未参与合并的新版本校记："
+                            + "、".join(witnesses[w]["siglum"] for w in extra if w in witnesses)
+                            + "，请重新确认"
+                        )
+                    conflicts.append({**base, "merge_status": merge["status"], "stale_reason": stale_reason,
+                                      "changed_witness_ids": changed,
+                                      "candidates": [self._candidate(witnesses[wid], variant)
+                                                     for wid, variant in latest.items()]})
+            elif latest:
+                undecided.append({**base,
+                                  "candidates": [self._candidate(witnesses[wid], variant)
+                                                 for wid, variant in latest.items()]})
+        return {"work": dict(work), "witnesses": list(witnesses.values()),
+                "merged": merged, "conflicts": conflicts, "undecided": undecided,
+                "gap_count": gaps[0]}
 
     def snapshot(self) -> dict:
         return {
